@@ -352,9 +352,8 @@ def cmd_batch(args):
 
     total_audio = 0.0
     for i, res in enumerate(results):
-        out_path = os.path.join(
-            args.output_dir, f"out_{res.request_id or i:0>4}.wav"
-        )
+        name = res.request_id if res.request_id else f"{i:04d}"
+        out_path = os.path.join(args.output_dir, f"out_{name}.wav")
         _write_audio(out_path, res.audio, res.sample_rate)
         dur = len(res.audio) / res.sample_rate if res.sample_rate else 0.0
         total_audio += dur

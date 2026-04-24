@@ -76,10 +76,10 @@ def _apply_per_row_penalty_(
     # Clamp negatives to 0 (a valid index) but mask them out before scatter.
     hist = token_history_2d
     valid = hist >= 0
-    safe = hist.clamp(min=0)
+    clamped_hist = hist.clamp(min=0)
     seen = torch.zeros(B, V, dtype=torch.bool, device=logits_2d.device)
-    # scatter True into seen at positions safe[b, t] where valid[b, t]
-    seen.scatter_(1, safe, valid)
+    # scatter True into seen at positions clamped_hist[b, t] where valid[b, t]
+    seen.scatter_(1, clamped_hist, valid)
     # Apply penalty: divide when logit > 0 else multiply.
     penalized = torch.where(
         logits_2d > 0, logits_2d / repetition_penalty, logits_2d * repetition_penalty
