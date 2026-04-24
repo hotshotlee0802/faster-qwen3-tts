@@ -305,6 +305,68 @@ def cmd_serve(args):
         print(f"Wrote {out_path} (dur {audio_dur:.2f}s, RTF {rtf:.2f})")
 
 
+def cmd_batch(args):
+    """Concurrent batch generation from a JSONL file.
+
+    Each JSON line is an object with at least ``text``, plus optional
+    ``language``, ``ref_audio``, ``ref_text``, ``speaker``, ``instruct``,
+    and sampling params. All lines must share the same ``mode``.
+    """
+    import json
+
+    from faster_qwen3_tts.engine import Request
+
+    with open(args.input, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+
+    if not entries:
+        print("No requests in input file.")
+        return
+
+    requests = []
+    for i, e in enumerate(entries):
+        req = Request(
+            text=e["text"],
+            language=e.get("language", args.language),
+            mode=args.mode,
+            ref_audio=e.get("ref_audio", args.ref_audio),
+            ref_text=e.get("ref_text", args.ref_text or ""),
+            speaker=e.get("speaker", args.speaker),
+            instruct=e.get("instruct", args.instruct or None),
+            xvec_only=bool(e.get("xvec_only", False)),
+            max_new_tokens=int(e.get("max_new_tokens", args.max_new_tokens)),
+            temperature=float(e.get("temperature", args.temperature)),
+            top_k=int(e.get("top_k", args.top_k)),
+            repetition_penalty=float(e.get("repetition_penalty", args.repetition_penalty)),
+            do_sample=not args.greedy,
+            request_id=e.get("request_id", str(i)),
+        )
+        requests.append(req)
+
+    model = _load_model(args.model, args.device, args.dtype)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    start = time.perf_counter()
+    results = model.generate_batch(requests)
+    total_time = time.perf_counter() - start
+
+    total_audio = 0.0
+    for i, res in enumerate(results):
+        out_path = os.path.join(
+            args.output_dir, f"out_{res.request_id or i:0>4}.wav"
+        )
+        _write_audio(out_path, res.audio, res.sample_rate)
+        dur = len(res.audio) / res.sample_rate if res.sample_rate else 0.0
+        total_audio += dur
+        print(f"Wrote {out_path} (dur {dur:.2f}s)")
+
+    rtf = total_audio / total_time if total_time > 0 else 0.0
+    print(
+        f"Batch of {len(results)} finished in {total_time:.2f}s "
+        f"(total {total_audio:.2f}s audio, aggregate RTF {rtf:.2f})"
+    )
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="faster-qwen3-tts", description="FasterQwen3TTS CLI")
     p.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
@@ -393,6 +455,26 @@ def build_parser():
     sp.add_argument("--greedy", action="store_true", help="Disable sampling")
     sp.add_argument("--output-dir", default="outputs", help="Directory for output wavs")
     sp.set_defaults(fn=cmd_serve)
+
+    sp = sub.add_parser(
+        "batch",
+        help="Concurrent batch synthesis from a JSONL input file (one request per line)",
+    )
+    sp.add_argument("--input", required=True, help="JSONL file with one request per line")
+    sp.add_argument("--mode", required=True, choices=["voice_clone", "custom_voice", "voice_design"])
+    sp.add_argument("--model", required=True, help="Model id or local path")
+    sp.add_argument("--output-dir", default="outputs", help="Directory for output wavs")
+    sp.add_argument("--language", default="English", help="Default language for entries missing one")
+    sp.add_argument("--ref-audio", default=None, help="Default ref_audio for voice_clone")
+    sp.add_argument("--ref-text", default=None, help="Default ref_text for voice_clone")
+    sp.add_argument("--speaker", default=None, help="Default speaker for custom_voice")
+    sp.add_argument("--instruct", default=None, help="Default instruct for voice_design")
+    sp.add_argument("--max-new-tokens", type=int, default=2048)
+    sp.add_argument("--temperature", type=float, default=0.9)
+    sp.add_argument("--top-k", type=int, default=50)
+    sp.add_argument("--repetition-penalty", type=float, default=1.05)
+    sp.add_argument("--greedy", action="store_true", help="Disable sampling")
+    sp.set_defaults(fn=cmd_batch)
 
     return p
 

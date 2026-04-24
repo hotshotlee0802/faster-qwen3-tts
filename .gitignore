@@ -6,3 +6,6 @@ sample_*.wav
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
+build/
+dist/
