@@ -1361,10 +1361,11 @@ class FasterQwen3TTS:
             # single-request calls on this model still benefit from graph capture.
             try:
                 self._warmup(tie.shape[1])
-            except Exception:  # noqa: BLE001 - best-effort
+            except Exception:  # noqa: BLE001 - best-effort warmup; log full traceback for debugging
                 logger.warning(
                     "CUDA graph warmup failed during generate_batch; "
-                    "single-request graph capture deferred."
+                    "single-request graph capture deferred.",
+                    exc_info=True,
                 )
 
         m = self.model.model

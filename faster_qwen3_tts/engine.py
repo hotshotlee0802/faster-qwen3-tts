@@ -401,7 +401,7 @@ class TTSEngine:
 
         try:
             results = self.model.generate_batch(reqs)
-        except BaseException as err:  # noqa: BLE001 - propagate to handles
+        except Exception as err:  # propagate to handles; let KeyboardInterrupt/SystemExit bubble
             for h in handles:
                 h._set_error(err)
             raise
