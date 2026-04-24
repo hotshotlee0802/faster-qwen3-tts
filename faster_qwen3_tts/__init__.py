@@ -1,8 +1,8 @@
 """
 faster-qwen3-tts: Real-time Qwen3-TTS inference using CUDA graphs
 """
-from .engine import Request, Result
+from .engine import Request, Result, RequestHandle, TTSEngine
 from .model import FasterQwen3TTS
 
 __version__ = "0.2.6"
-__all__ = ["FasterQwen3TTS", "Request", "Result"]
+__all__ = ["FasterQwen3TTS", "Request", "Result", "RequestHandle", "TTSEngine"]

@@ -90,9 +90,9 @@ def _apply_per_row_penalty_(
 def sample_logits(
     logits: torch.Tensor,
     *,
-    temperature: float,
-    top_k: int,
-    top_p: float,
+    temperature,
+    top_k,
+    top_p,
     do_sample: bool,
     suppress_mask: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Iterable[int]] = None,
@@ -100,6 +100,18 @@ def sample_logits(
     """Sample a token from logits.
 
     Mirrors HF order: suppress -> temperature -> top-k -> top-p -> sample.
+
+    Supports both batch-uniform (scalar) and per-row sampling parameters.
+    With ``logits`` of shape ``[B, V]`` (or ``[1, V]``):
+
+    * ``temperature``: ``float`` or ``[B]``/``[B, 1]`` tensor.
+    * ``top_k``: ``int`` or length-``B`` sequence / 1-D tensor. A per-row value of
+      ``0`` (or ``>= V``) disables top-k for that row.
+    * ``top_p``: ``float`` or length-``B`` sequence / 1-D tensor. A per-row value
+      ``>= 1.0`` disables top-p for that row.
+
+    The implementation keeps the batch-uniform fast path unchanged (same ops as
+    before) so single-request behavior is bit-identical to previous releases.
     """
     logits = logits.clone()
     if suppress_mask is not None:
@@ -108,11 +120,62 @@ def sample_logits(
         logits[..., list(suppress_tokens)] = float("-inf")
     if not do_sample:
         return torch.argmax(logits, dim=-1)
-    logits = logits / temperature
-    if top_k > 0:
-        topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-        logits = torch.where(logits < topk_vals[..., -1:], torch.full_like(logits, float("-inf")), logits)
-    if top_p < 1.0:
+
+    # --- temperature -----------------------------------------------------
+    temp_is_tensor = torch.is_tensor(temperature)
+    if temp_is_tensor:
+        t = temperature.to(logits.device, dtype=logits.dtype)
+        if t.dim() == 1:
+            t = t.view(-1, *([1] * (logits.dim() - 1)))
+        logits = logits / t
+    else:
+        logits = logits / temperature
+
+    # --- top-k -----------------------------------------------------------
+    top_k_is_seq = _is_per_row(top_k)
+    if top_k_is_seq:
+        k_row = torch.as_tensor(top_k, device=logits.device, dtype=torch.long)
+        V = logits.size(-1)
+        max_k = int(k_row.max().item())
+        # Rows with k==0 or k>=V mean "no filtering"; represent as k=V for threshold.
+        effective_k = torch.where((k_row <= 0) | (k_row >= V), torch.full_like(k_row, V), k_row)
+        if max_k > 0 and max_k < V:
+            # Compute top-(max_k) once, then per-row pick the k-th element as threshold.
+            topk_vals, _ = torch.topk(logits, max_k, dim=-1)  # [..., max_k]
+            idx = (effective_k.clamp(max=max_k) - 1).clamp(min=0)
+            # Gather per-row thresholds; shape matches logits's leading dims.
+            thresh = topk_vals.gather(-1, idx.view(*idx.shape, 1))
+            mask = logits < thresh
+            # For rows that disable top-k (effective_k >= V), do not mask anything.
+            disable = (effective_k >= V).view(*effective_k.shape, 1)
+            mask = mask & ~disable
+            logits = logits.masked_fill(mask, float("-inf"))
+    else:
+        if top_k > 0:
+            topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits = torch.where(
+                logits < topk_vals[..., -1:], torch.full_like(logits, float("-inf")), logits
+            )
+
+    # --- top-p -----------------------------------------------------------
+    top_p_is_seq = _is_per_row(top_p)
+    if top_p_is_seq:
+        p_row = torch.as_tensor(top_p, device=logits.device, dtype=logits.dtype)
+        if p_row.dim() == 1:
+            p_row = p_row.view(-1, *([1] * (logits.dim() - 1)))
+        # Only filter rows whose p < 1.0. We still run the sort to keep shapes
+        # regular, and rely on the row mask to no-op the disabled rows.
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
+        sorted_indices_to_remove = cumulative_probs > p_row
+        sorted_indices_to_remove[..., 0] = False
+        disable_row = (p_row >= 1.0).expand_as(sorted_indices_to_remove)
+        sorted_indices_to_remove = sorted_indices_to_remove & ~disable_row
+        sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
+        logits = torch.full_like(logits, float("-inf"))
+        logits.scatter_(-1, sorted_indices, sorted_logits)
+    elif top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
@@ -121,4 +184,14 @@ def sample_logits(
         sorted_logits[sorted_indices_to_remove] = float("-inf")
         logits = torch.full_like(logits, float("-inf"))
         logits.scatter_(-1, sorted_indices, sorted_logits)
+
     return torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+
+
+def _is_per_row(x) -> bool:
+    """Return True if ``x`` looks like a per-row sampling parameter (seq/tensor)."""
+    if torch.is_tensor(x):
+        return x.dim() >= 1
+    if isinstance(x, (list, tuple)):
+        return True
+    return False

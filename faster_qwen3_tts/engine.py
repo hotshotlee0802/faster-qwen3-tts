@@ -241,3 +241,189 @@ def batched_talker_generate(
         "steps_per_s": (steps / total_time) if total_time > 0 else 0.0,
     }
     return codes_list, timing
+
+
+# =============================================================================
+# TTSEngine — long-lived scheduler with submit() / RequestHandle streaming API
+# =============================================================================
+
+
+class RequestHandle:
+    """Result handle returned by :meth:`TTSEngine.submit`.
+
+    Iterating over the handle yields ``(audio_chunk, sample_rate, timing)``
+    tuples, mirroring the existing streaming APIs. A final sentinel tuple
+    ``(None, sample_rate, timing)`` is *not* emitted; iteration simply stops
+    once the request is complete.
+
+    The handle is also a future-like: :meth:`result` waits for the request to
+    finish and returns the full :class:`Result`.
+    """
+
+    def __init__(self, request: "Request") -> None:
+        self.request = request
+        self._result: Optional["Result"] = None
+        # A list of pre-chunked audio segments. The Phase-2 lockstep-cohort
+        # engine fills this in one shot after the batched decode; the
+        # continuous-batching engine (future) would push chunks here as they
+        # become available.
+        self._chunks: List[Tuple[np.ndarray, int, Dict[str, float]]] = []
+        self._done: bool = False
+        self._error: Optional[BaseException] = None
+
+    # Internal API used by TTSEngine ---------------------------------------
+
+    def _push_chunk(
+        self, audio: np.ndarray, sample_rate: int, timing: Dict[str, float]
+    ) -> None:
+        self._chunks.append((audio, sample_rate, timing))
+
+    def _set_result(self, result: "Result") -> None:
+        self._result = result
+        self._done = True
+
+    def _set_error(self, err: BaseException) -> None:
+        self._error = err
+        self._done = True
+
+    # Public API -----------------------------------------------------------
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    def result(self) -> "Result":
+        """Return the final :class:`Result` for this request.
+
+        Raises whatever exception the engine recorded for this request, if any.
+        """
+        if not self._done:
+            raise RuntimeError(
+                "RequestHandle.result() called before the engine finished "
+                "the request. In the lockstep-cohort engine, result() is "
+                "only valid after TTSEngine.flush() or .run_pending() returns."
+            )
+        if self._error is not None:
+            raise self._error
+        assert self._result is not None
+        return self._result
+
+
+class TTSEngine:
+    """Concurrent request scheduler around a :class:`FasterQwen3TTS` instance.
+
+    The engine runs in "lockstep cohort" mode (the plan's Phase 2 option (b)):
+    callers submit requests, which are queued; :meth:`run_pending` pops up to
+    ``max_batch_size`` same-mode requests and executes them together through
+    :meth:`FasterQwen3TTS.generate_batch`. Results are dispatched back to
+    their ``RequestHandle``.
+
+    Continuous batching (option (a) in the plan — admitting new requests
+    mid-decode) is a future extension, which will be built on top of
+    :class:`BatchedStaticCache`. The public submit/handle API is designed to
+    remain unchanged when that switch happens.
+
+    Args:
+        model: A ready :class:`FasterQwen3TTS` instance.
+        max_batch_size: Maximum number of requests per cohort. Defaults to 4.
+
+    Example:
+        >>> engine = TTSEngine(model, max_batch_size=4)
+        >>> h1 = engine.submit(Request(text="hello", mode="custom_voice", speaker="A"))
+        >>> h2 = engine.submit(Request(text="world", mode="custom_voice", speaker="B"))
+        >>> engine.run_pending()
+        >>> print(h1.result().audio.shape, h2.result().audio.shape)
+    """
+
+    def __init__(self, model, *, max_batch_size: int = 4) -> None:
+        if max_batch_size < 1:
+            raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
+        self.model = model
+        self.max_batch_size = int(max_batch_size)
+        self._pending: List[Tuple["Request", RequestHandle]] = []
+
+    # ------------------------------------------------------------------
+    # Submission / queue management
+    # ------------------------------------------------------------------
+
+    def submit(self, request: "Request") -> RequestHandle:
+        """Enqueue a request. Returns a handle; actual work is triggered by
+        :meth:`run_pending` (or :meth:`flush`)."""
+        if not isinstance(request, Request):
+            raise TypeError(
+                f"TTSEngine.submit expects a Request, got {type(request).__name__}"
+            )
+        handle = RequestHandle(request)
+        self._pending.append((request, handle))
+        return handle
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    def run_pending(self) -> int:
+        """Run one cohort of pending requests through the batched model.
+
+        Groups the queue by ``mode`` (since ``generate_batch`` requires a
+        single mode) and dispatches the *first* mode group, up to
+        ``max_batch_size`` requests. Returns the number of requests that were
+        executed (0 if the queue is empty).
+
+        Call repeatedly — or use :meth:`flush` — to drain the queue.
+        """
+        if not self._pending:
+            return 0
+
+        # Peel off the first same-mode cohort at the head of the queue, up to
+        # max_batch_size.
+        head_mode = self._pending[0][0].mode
+        cohort: List[Tuple["Request", RequestHandle]] = []
+        remaining: List[Tuple["Request", RequestHandle]] = []
+        for req, handle in self._pending:
+            if len(cohort) < self.max_batch_size and req.mode == head_mode:
+                cohort.append((req, handle))
+            else:
+                remaining.append((req, handle))
+        self._pending = remaining
+
+        reqs = [r for r, _ in cohort]
+        handles = [h for _, h in cohort]
+
+        try:
+            results = self.model.generate_batch(reqs)
+        except BaseException as err:  # noqa: BLE001 - propagate to handles
+            for h in handles:
+                h._set_error(err)
+            raise
+
+        for handle, res in zip(handles, results):
+            # The lockstep engine delivers a single "chunk" per request: the
+            # full audio. Future continuous-batching mode will emit multiple
+            # chunks here, but the handle contract is already chunk-oriented.
+            handle._push_chunk(res.audio, res.sample_rate, dict(res.timing))
+            handle._set_result(res)
+        return len(cohort)
+
+    def flush(self) -> int:
+        """Drain the queue by repeatedly calling :meth:`run_pending`.
+
+        Returns total number of requests executed.
+        """
+        total = 0
+        while self._pending:
+            executed = self.run_pending()
+            if executed == 0:
+                # Defensive: avoid infinite loop if a bug leaves items pending.
+                break
+            total += executed
+        return total
