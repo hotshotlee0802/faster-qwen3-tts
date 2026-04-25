@@ -61,8 +61,11 @@ from faster_qwen3_tts.engine import batched_talker_generate, Request, Result
 
 
 # =============================================================================
-# Fake row-independent talker
+# Shared constants
 # =============================================================================
+
+# Codec EOS id used by both the fake talker and the fake config — keep in sync.
+_EOS_ID = 2
 
 
 class _FakeRowIndependentTalker:
@@ -83,7 +86,7 @@ class _FakeRowIndependentTalker:
     ``batched_talker_generate``).
     """
 
-    EOS_ID = 2
+    EOS_ID = _EOS_ID
 
     def __init__(self, num_real_steps: int = 5, num_code_groups: int = 16) -> None:
         self.num_real_steps = num_real_steps
@@ -149,7 +152,7 @@ class _FakeRowIndependentTalker:
 
 
 class _FakeConfig:
-    codec_eos_token_id = _FakeRowIndependentTalker.EOS_ID
+    codec_eos_token_id = _EOS_ID
     num_code_groups = 16
     vocab_size = 2048
 
@@ -310,18 +313,20 @@ def test_multi_batch_sizes_match_solo():
 
     emb_A = torch.randn(1, L, H)
     embs_others = torch.randn(3, L, H)
-    mask_B = lambda B: torch.ones(B, L, dtype=torch.long)  # noqa: E731
+
+    def full_mask(b):
+        return torch.ones(b, L, dtype=torch.long)
 
     # B=1: row A alone.
-    codes_1 = _run_batched(talker, emb_A, mask_B(1))
+    codes_1 = _run_batched(talker, emb_A, full_mask(1))
 
     # B=2: rows [A, X].
     emb_2 = torch.cat([emb_A, embs_others[0:1]], dim=0)
-    codes_2 = _run_batched(talker, emb_2, mask_B(2))
+    codes_2 = _run_batched(talker, emb_2, full_mask(2))
 
     # B=4: rows [A, X, Y, Z].
     emb_4 = torch.cat([emb_A, embs_others], dim=0)
-    codes_4 = _run_batched(talker, emb_4, mask_B(4))
+    codes_4 = _run_batched(talker, emb_4, full_mask(4))
 
     for label, codes in (("B=2", codes_2), ("B=4", codes_4)):
         assert codes[0] is not None, f"{label}: row 0 is None"
@@ -357,7 +362,7 @@ def test_do_sample_false_is_the_key_condition():
     assert torch.equal(codes_solo[0], codes_batch[0])
 
     # Verify token values are non-EOS (real tokens, not just zeros).
-    assert not (codes_solo[0][:, 0] == _FakeRowIndependentTalker.EOS_ID).any(), (
+    assert not (codes_solo[0][:, 0] == _EOS_ID).any(), (
         "Codec tokens should not contain EOS (EOS is stripped by batched_talker_generate)"
     )
 
